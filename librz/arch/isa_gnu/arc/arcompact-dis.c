@@ -537,11 +537,10 @@ DOCOMM:
 }
 
 static const char *condName[] = {
-	/* 0..15. */
 	"", "z", "nz", "p", "n", "c", "nc", "v",
 	"nv", "gt", "ge", "lt", "le", "hi", "ls", "pnz",
-	"ss", "sc"
-
+	"ss", "sc", "", "", "", "", "", "", "", "",
+	"", "", "", "", "", "al"
 };
 
 static void
@@ -563,7 +562,7 @@ write_instr_name_(struct arcDisState *state,
 		if (!condCodeIsPartOfName) {
 			strcat(state->instrBuffer, ".");
 		}
-		condlim = 18;
+		condlim = 32;
 		if (cond < condlim) {
 			cc = condName[cond];
 		} else {
@@ -956,7 +955,6 @@ dsmOneArcInst(bfd_vma addr, struct arcDisState *state, disassemble_info *info) {
 		break;
 
 	case op_LD:
-		/* Load register with offset [major opcode 2]  */
 		decodingClass = 6;
 		switch (BITS(state->words[0], 7, 8)) {
 		case 0:
@@ -971,6 +969,10 @@ dsmOneArcInst(bfd_vma addr, struct arcDisState *state, disassemble_info *info) {
 			instrName = "ldw";
 			state->_load_len = 2;
 			break;
+		case 3:
+			instrName = "ldh";
+			state->_load_len = 2;
+			break;
 		default:
 			instrName = "??? (0[3])";
 			state->flow = invalid_instr;
@@ -979,12 +981,12 @@ dsmOneArcInst(bfd_vma addr, struct arcDisState *state, disassemble_info *info) {
 		break;
 
 	case op_ST:
-		/* Store register with offset [major opcode 0x03] */
 		decodingClass = 7;
 		switch (BITS(state->words[0], 1, 2)) {
 		case 0: instrName = "st"; break;
 		case 1: instrName = "stb"; break;
 		case 2: instrName = "stw"; break;
+		case 3: instrName = "sth"; break;
 		default:
 			instrName = "??? (2[3])";
 			state->flow = invalid_instr;
@@ -1195,6 +1197,7 @@ dsmOneArcInst(bfd_vma addr, struct arcDisState *state, disassemble_info *info) {
 		case 8: instrName = "divaw"; break;
 		case 0xA: instrName = "asls"; break;
 		case 0xB: instrName = "asrs"; break;
+		case 0x20: instrName = "mpy"; break;
 		case 0x28: instrName = "addsdw"; break;
 		case 0x29: instrName = "subsdw"; break;
 
@@ -1208,7 +1211,6 @@ dsmOneArcInst(bfd_vma addr, struct arcDisState *state, disassemble_info *info) {
 				instrName = "norm";
 				decodingClass = 1;
 				break;
-				/* ARC A700 DSP Extensions */
 			case 2:
 				instrName = "sat16";
 				decodingClass = 1;
@@ -1233,22 +1235,29 @@ dsmOneArcInst(bfd_vma addr, struct arcDisState *state, disassemble_info *info) {
 				instrName = "negs";
 				decodingClass = 1;
 				break;
-
 			case 8:
 				instrName = "normw";
 				decodingClass = 1;
 				break;
-
-			/* START ARC LOCAL */
 			case 9:
 				instrName = "swape";
 				decodingClass = 1;
 				break;
-				/* END ARC LOCAL */
-
 			default:
 				instrName = "???";
 				state->flow = invalid_instr;
+				break;
+			}
+			break;
+		case 63:
+			switch (BITS(state->words[0], 6, 11)) {
+			case 32: instrName = "ffs"; decodingClass = 1; break;
+			case 38: instrName = "fls"; decodingClass = 1; break;
+			case 44: instrName = "fls"; decodingClass = 1; break;
+			case 50: instrName = "ffs"; decodingClass = 1; break;
+			default:
+				instrName = "ffs";
+				decodingClass = 1;
 				break;
 			}
 			break;
@@ -1261,21 +1270,29 @@ dsmOneArcInst(bfd_vma addr, struct arcDisState *state, disassemble_info *info) {
 
 	/* START ARC LOCAL */
 	case op_MAJOR_6:
-		decodingClass = 44;
+		decodingClass = 5;
+		state->_load_len = 4;
 		subopcode = BITS(state->words[0], 0, 5);
 		switch (subopcode) {
-		case 0: instrName = "ld"; state->_load_len = 4; decodingClass = 5; break;
-		case 1: instrName = "ldb"; state->_load_len = 1; decodingClass = 5; break;
-		case 2: instrName = "ldw"; state->_load_len = 2; decodingClass = 5; break;
-		case 3: instrName = "ldh"; state->_load_len = 2; decodingClass = 5; break;
+		case 0: instrName = "ld"; break;
+		case 1: instrName = "ldb"; state->_load_len = 1; break;
+		case 2: instrName = "ldw"; state->_load_len = 2; break;
+		case 3: instrName = "ldh"; state->_load_len = 2; break;
 		case 4: instrName = "st"; decodingClass = 6; break;
 		case 5: instrName = "stb"; decodingClass = 6; break;
 		case 6: instrName = "stw"; decodingClass = 6; break;
 		case 7: instrName = "sth"; decodingClass = 6; break;
-		case 26: instrName = "rtsc"; break;
+		case 8: instrName = "prefetch"; break;
+		case 9: instrName = "prefetchw"; break;
+		case 10: instrName = "ex"; decodingClass = 34; break;
+		case 11: instrName = "llock"; decodingClass = 34; break;
+		case 12: instrName = "scond"; decodingClass = 34; break;
+		case 13: instrName = "llockd"; decodingClass = 34; break;
+		case 14: instrName = "scondd"; decodingClass = 34; break;
+		case 15: instrName = "ldl"; break;
+		case 26: instrName = "rtsc"; decodingClass = 44; break;
 		default:
-			instrName = "??? (2[3])";
-			state->flow = invalid_instr;
+			instrName = "ld";
 			break;
 		}
 		break;
@@ -1283,12 +1300,30 @@ dsmOneArcInst(bfd_vma addr, struct arcDisState *state, disassemble_info *info) {
 
 	case op_MAJOR_7:
 		decodingClass = 0;
-		subopcode = BITS(state->words[0], 0, 5);
+		subopcode = BITS(state->words[0], 16, 21);
 		switch (subopcode) {
 		case 0: instrName = "asl"; break;
 		case 1: instrName = "asr"; break;
 		case 2: instrName = "lsr"; break;
 		case 3: instrName = "ror"; break;
+		case 4: instrName = "rrc"; break;
+		case 5: instrName = "sexb"; break;
+		case 6: instrName = "sexw"; break;
+		case 7: instrName = "extb"; break;
+		case 8: instrName = "extw"; break;
+		case 9: instrName = "abs"; break;
+		case 10: instrName = "not"; break;
+		case 11: instrName = "rlc"; break;
+		case 12: instrName = "ex"; decodingClass = 34; break;
+		case 13: instrName = "neg"; break;
+		case 14: instrName = "swap"; decodingClass = 1; break;
+		case 15: instrName = "norm"; decodingClass = 1; break;
+		case 0x1f: instrName = "divaw"; break;
+		case 0x20: instrName = "mpy"; break;
+		case 0x26: instrName = "mpyh"; break;
+		case 0x2d: instrName = "mpyu"; break;
+		case 0x30: instrName = "mpyhu"; break;
+		case 0x37: instrName = "mpyhhu"; break;
 		default:
 			instrName = "??? (7[3])";
 			state->flow = invalid_instr;
