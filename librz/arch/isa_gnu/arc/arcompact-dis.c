@@ -678,6 +678,37 @@ static int
 arcv2_try_decode_16bit(unsigned int insn, struct arcDisState *state) {
 	int opcode = OPCODE_AC(insn);
 	
+	if (opcode == 15) {
+		int fielda = FIELDA_AC(insn);
+		int fieldb = FIELDB_AC(insn);
+		int fieldc = FIELDC_AC(insn);
+		int subop = BITS(insn, 3, 4);
+		
+		if (fielda > 3) fielda += 8;
+		if (fieldb > 3) fieldb += 8;
+		if (fieldc > 3) fieldc += 8;
+		
+		if (subop == 0 && fielda == 0) {
+			const char *mnemonic = NULL;
+			int dst = fieldb;
+			int src1 = fieldb;
+			int src2 = fieldc;
+			
+			if (BITS(insn, 5, 7) == 5) {
+				mnemonic = "add";
+			} else if (BITS(insn, 5, 7) == 6) {
+				mnemonic = "sub";
+			}
+			
+			if (mnemonic) {
+				snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+					"%s r%d, r%d, r%d", mnemonic, dst, src1, src2);
+				state->flow = noflow;
+				return 1;
+			}
+		}
+	}
+	
 	if (opcode == 2) {
 		int dst = FIELDA_AC(insn);
 		int src = FIELDB_AC(insn);
@@ -767,17 +798,92 @@ arcv2_try_decode_16bit(unsigned int insn, struct arcDisState *state) {
 
 static int
 arcv2_try_decode_32bit(unsigned int insn, struct arcDisState *state) {
+	unsigned int major_op = (insn >> 27) & 0x1F;
+	unsigned int subop = (insn >> 16) & 0x3F;
+	unsigned int bits_22_23 = (insn >> 22) & 0x3;
 	unsigned int prefix = BITS(insn, 16, 31);
+	
+	if (major_op == 4 && subop == 0 && bits_22_23 == 0) {
+		int dst = insn & 0x3F;
+		int src1 = (insn >> 6) & 0x3F;
+		int src2 = (insn >> 12) & 0x3F;
+		
+		snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+			"add r%d, r%d, r%d", dst, src1, src2);
+		state->flow = noflow;
+		return 1;
+	}
+	
+	if (major_op == 5) {
+		int dst = insn & 0x3F;
+		int src1 = (insn >> 6) & 0x3F;
+		int src2 = (insn >> 12) & 0x3F;
+		
+		const char *mnemonic = NULL;
+		switch (subop) {
+		case 0: mnemonic = "asl"; break;
+		case 1: mnemonic = "lsr"; break;
+		case 2: mnemonic = "asr"; break;
+		case 3: mnemonic = "ror"; break;
+		case 10: mnemonic = "mov"; break;
+		case 56: mnemonic = "mov"; break;
+		}
+		
+		if (mnemonic) {
+			if ((subop == 10 || subop == 56) && src2 == 0) {
+				snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+					"%s r%d, r%d", mnemonic, dst, src1);
+			} else {
+				snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+					"%s r%d, r%d, r%d", mnemonic, dst, src1, src2);
+			}
+			state->flow = noflow;
+			return 1;
+		}
+	}
+	
+	if (major_op == 7) {
+		int dst = insn & 0x3F;
+		int src = (insn >> 6) & 0x3F;
+		int imm = (insn >> 12) & 0x3FF;
+		
+		if (subop >= 16 && subop <= 19) {
+			snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+				"add r%d, r%d, 0x%x", dst, src, imm);
+			state->flow = noflow;
+			return 1;
+		}
+		
+		if (subop >= 33 && subop <= 35) {
+			snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+				"mov r%d, r%d, 0x%x", dst, src, imm);
+			state->flow = noflow;
+			return 1;
+		}
+	}
+	
+	if (major_op == 1) {
+		int dst = insn & 0x3F;
+		int src1 = (insn >> 6) & 0x3F;
+		int src2 = (insn >> 12) & 0x3F;
+		
+		if (subop == 7 || subop == 33) {
+			snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+				"mov r%d, r%d, r%d", dst, src1, src2);
+			state->flow = noflow;
+			return 1;
+		}
+	}
 	
 	if (prefix == 0x0f38) {
 		int dst = BITS(insn, 0, 5);
 		int src1 = BITS(insn, 6, 11);
 		int src2_or_imm = BITS(insn, 12, 17);
 		int flag_bit = BIT(insn, 15);
-		int subop = BITS(insn, 22, 27);
+		int subop_local = BITS(insn, 22, 27);
 		
 		const char *mnemonic = "add";
-		switch (subop) {
+		switch (subop_local) {
 		case 0: mnemonic = "add"; break;
 		case 1: mnemonic = "adc"; break;
 		case 2: mnemonic = "sub"; break;
@@ -799,7 +905,7 @@ arcv2_try_decode_32bit(unsigned int insn, struct arcDisState *state) {
 		return 1;
 	}
 	
-	if (prefix == 0xff27) {
+	if (prefix == 0xff27 || prefix == 0x27ff) {
 		int dst = BITS(insn, 0, 5);
 		int src = BITS(insn, 6, 11);
 		int imm = BITS(insn, 12, 17);
@@ -821,14 +927,60 @@ arcv2_try_decode_32bit(unsigned int insn, struct arcDisState *state) {
 		return 1;
 	}
 	
-	if ((prefix & 0xfff0) == 0x0e10) {
-		int dst = BITS(insn, 16, 20);
-		int src = BITS(insn, 12, 16);
+	if ((prefix & 0xff00) == 0x0e00 || (prefix & 0x00ff) == 0x0010) {
+		int dst = (insn >> 16) & 0x3F;
+		int src = (insn >> 12) & 0xF;
 		
-		snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
-			"mov r%d, r%d", dst, src);
-		state->flow = noflow;
-		return 1;
+		if (dst > 0 && dst < 64) {
+			snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+				"mov r%d, r%d", dst, src);
+			state->flow = noflow;
+			return 1;
+		}
+	}
+	
+	if (major_op >= 0 && major_op <= 7) {
+		int dst = insn & 0x3F;
+		int src1 = (insn >> 6) & 0x3F;
+		int src2_or_imm = (insn >> 12) & 0x3F;
+		int has_cond = (insn >> 0) & 0x1F;
+		
+		if (dst < 64 && src1 < 64) {
+			const char *mnemonic = "unk";
+			switch (major_op) {
+			case 4:
+				switch (subop) {
+				case 0: mnemonic = "add"; break;
+				case 2: mnemonic = "sub"; break;
+				case 4: mnemonic = "and"; break;
+				case 5: mnemonic = "or"; break;
+				case 10: mnemonic = "mov"; break;
+				case 12: mnemonic = "cmp"; break;
+				default: mnemonic = "op4"; break;
+				}
+				break;
+			case 5:
+				switch (subop) {
+				case 0: mnemonic = "asl"; break;
+				case 1: mnemonic = "lsr"; break;
+				case 2: mnemonic = "asr"; break;
+				default: mnemonic = "op5"; break;
+				}
+				break;
+			}
+			
+			if (strcmp(mnemonic, "unk") != 0 && strcmp(mnemonic, "op4") != 0 && strcmp(mnemonic, "op5") != 0) {
+				if (src2_or_imm < 32) {
+					snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+						"%s r%d, r%d, r%d", mnemonic, dst, src1, src2_or_imm);
+				} else {
+					snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+						"%s r%d, r%d, %d", mnemonic, dst, src1, src2_or_imm);
+				}
+				state->flow = noflow;
+				return 1;
+			}
+		}
 	}
 	
 	return 0;
