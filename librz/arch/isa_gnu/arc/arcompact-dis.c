@@ -675,6 +675,166 @@ sign_extend(int value, int bits) {
 	return value;
 }
 
+static int
+arcv2_try_decode_16bit(unsigned int insn, struct arcDisState *state) {
+	int opcode = OPCODE_AC(insn);
+	
+	if (opcode == 2) {
+		int dst = FIELDA_AC(insn);
+		int src = FIELDB_AC(insn);
+		int imm = FIELDC_AC(insn) + 1;
+		int subop = BITS(insn, 3, 4);
+		int flag_bit = BIT(insn, 15);
+		
+		if (dst > 3) dst += 8;
+		if (src > 3) src += 8;
+		
+		const char *mnemonic = NULL;
+		switch (subop) {
+		case 0: mnemonic = "add"; break;
+		case 1: mnemonic = "sub"; break;
+		case 2: mnemonic = "asl"; break;
+		case 3: mnemonic = "asr"; break;
+		}
+		
+		if (mnemonic) {
+			if (imm == 0 && subop == 0) {
+				strcpy(state->instrBuffer, "nop");
+			} else {
+				snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+					"%s%s r%d, r%d, %d", mnemonic, flag_bit ? ".f" : "", dst, src, imm);
+			}
+			state->flow = noflow;
+			return 1;
+		}
+	}
+	
+	if (opcode == 3) {
+		int dst = FIELDA_AC(insn);
+		int src = FIELDB_AC(insn);
+		int shift_src = FIELDC_AC(insn);
+		int subop = BITS(insn, 3, 4);
+		int flag_bit = BIT(insn, 15);
+		
+		if (dst > 3) dst += 8;
+		if (src > 3) src += 8;
+		if (shift_src > 3) shift_src += 8;
+		
+		const char *mnemonic = NULL;
+		switch (subop) {
+		case 0: mnemonic = "asl"; break;
+		case 1: mnemonic = "lsr"; break;
+		case 2: mnemonic = "asr"; break;
+		case 3: mnemonic = "ror"; break;
+		}
+		
+		if (mnemonic) {
+			snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+				"%s%s r%d, r%d, r%d", mnemonic, flag_bit ? ".f" : "", dst, src, shift_src);
+			state->flow = noflow;
+			return 1;
+		}
+	}
+	
+	if (opcode == 1) {
+		int src1 = FIELDA_AC(insn);
+		int src2 = FIELDB_AC(insn);
+		int subop = BITS(insn, 0, 4);
+		
+		if (src1 > 3) src1 += 8;
+		if (src2 > 3) src2 += 8;
+		
+		const char *mnemonic = NULL;
+		switch (subop) {
+		case 0x17:
+		case 0x1f:
+			mnemonic = "cmp";
+			break;
+		case 0x07:
+			mnemonic = "tst";
+			break;
+		}
+		
+		if (mnemonic) {
+			snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+				"%s r%d, r%d", mnemonic, src1, src2);
+			state->flow = noflow;
+			return 1;
+		}
+	}
+	
+	return 0;
+}
+
+static int
+arcv2_try_decode_32bit(unsigned int insn, struct arcDisState *state) {
+	unsigned int prefix = BITS(insn, 16, 31);
+	
+	if (prefix == 0x0f38) {
+		int dst = BITS(insn, 0, 5);
+		int src1 = BITS(insn, 6, 11);
+		int src2_or_imm = BITS(insn, 12, 17);
+		int flag_bit = BIT(insn, 15);
+		int subop = BITS(insn, 22, 27);
+		
+		const char *mnemonic = "add";
+		switch (subop) {
+		case 0: mnemonic = "add"; break;
+		case 1: mnemonic = "adc"; break;
+		case 2: mnemonic = "sub"; break;
+		case 3: mnemonic = "sbc"; break;
+		case 4: mnemonic = "and"; break;
+		case 5: mnemonic = "or"; break;
+		case 6: mnemonic = "bic"; break;
+		case 7: mnemonic = "xor"; break;
+		}
+		
+		if (src2_or_imm < 32) {
+			snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+				"%s%s r%d, r%d, %d", mnemonic, flag_bit ? ".f" : "", dst, src1, src2_or_imm);
+		} else {
+			snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+				"%s%s r%d, r%d, LIMM", mnemonic, flag_bit ? ".f" : "", dst, src1);
+		}
+		state->flow = noflow;
+		return 1;
+	}
+	
+	if (prefix == 0xff27) {
+		int dst = BITS(insn, 0, 5);
+		int src = BITS(insn, 6, 11);
+		int imm = BITS(insn, 12, 17);
+		int nullify = BIT(insn, 5);
+		int flag_bit = BIT(insn, 15);
+		
+		const char *suffix = "";
+		if (nullify && flag_bit) {
+			suffix = ".n.f";
+		} else if (nullify) {
+			suffix = ".n";
+		} else if (flag_bit) {
+			suffix = ".f";
+		}
+		
+		snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+			"sub%s r%d, r%d, %d", suffix, dst, src, imm);
+		state->flow = noflow;
+		return 1;
+	}
+	
+	if ((prefix & 0xfff0) == 0x0e10) {
+		int dst = BITS(insn, 16, 20);
+		int src = BITS(insn, 12, 16);
+		
+		snprintf(state->instrBuffer, sizeof(state->instrBuffer), 
+			"mov r%d, r%d", dst, src);
+		state->flow = noflow;
+		return 1;
+	}
+	
+	return 0;
+}
+
 /* dsmOneArcInst - This module is used to identify the instruction
  *		   and to decode them based on the ARCtangent-A5
  *                 instruction set architecture.
@@ -717,9 +877,7 @@ dsmOneArcInst(bfd_vma addr, struct arcDisState *state, disassemble_info *info) {
 	state->sourceType = ARC_UNDEFINED;
 
 	/* ARCtangent-A5 basecase instruction and little-endian mode */
-	if ((info->endian == BFD_ENDIAN_LITTLE) && (state->instructionLen == 4)) {
-		state->words[0] = bfd_getm32(state->words[0]);
-	}
+
 
 	if (state->instructionLen == 4) {
 		if (!NEXT_WORD(0)) {
@@ -1103,10 +1261,18 @@ dsmOneArcInst(bfd_vma addr, struct arcDisState *state, disassemble_info *info) {
 
 	/* START ARC LOCAL */
 	case op_MAJOR_6:
-		decodingClass = 44; /* Default for Major opcode 6 ... */
+		decodingClass = 44;
 		subopcode = BITS(state->words[0], 0, 5);
 		switch (subopcode) {
-		case 26: /* 0x1a */ instrName = "rtsc"; break;
+		case 0: instrName = "ld"; state->_load_len = 4; decodingClass = 5; break;
+		case 1: instrName = "ldb"; state->_load_len = 1; decodingClass = 5; break;
+		case 2: instrName = "ldw"; state->_load_len = 2; decodingClass = 5; break;
+		case 3: instrName = "ldh"; state->_load_len = 2; decodingClass = 5; break;
+		case 4: instrName = "st"; decodingClass = 6; break;
+		case 5: instrName = "stb"; decodingClass = 6; break;
+		case 6: instrName = "stw"; decodingClass = 6; break;
+		case 7: instrName = "sth"; decodingClass = 6; break;
+		case 26: instrName = "rtsc"; break;
 		default:
 			instrName = "??? (2[3])";
 			state->flow = invalid_instr;
@@ -2182,11 +2348,16 @@ dsmOneArcInst(bfd_vma addr, struct arcDisState *state, disassemble_info *info) {
 				break;
 			}
 			break;
+		case 1: instrName = "breq_s"; break;
 		case 2: instrName = "sub_s"; break;
+		case 3: instrName = "brne_s"; break;
 		case 4: instrName = "and_s"; break;
 		case 5: instrName = "or_s"; break;
 		case 6: instrName = "bic_s"; break;
 		case 7: instrName = "xor_s"; break;
+		case 8: instrName = "tst_s"; break;
+		case 9: instrName = "mul64_s"; break;
+		case 10: instrName = "sexb_s"; break;
 		case 11:
 			instrName = "tst_s";
 			decodingClass = 14;
@@ -2227,6 +2398,7 @@ dsmOneArcInst(bfd_vma addr, struct arcDisState *state, disassemble_info *info) {
 		case 20: instrName = "add1_s"; break;
 		case 21: instrName = "add2_s"; break;
 		case 22: instrName = "add3_s"; break;
+		case 23: instrName = "asl_s"; break;
 		case 24: instrName = "asl_s"; break;
 		case 25: instrName = "lsr_s"; break;
 		case 26: instrName = "asr_s"; break;
@@ -2430,9 +2602,17 @@ dsmOneArcInst(bfd_vma addr, struct arcDisState *state, disassemble_info *info) {
 		break;
 	}
 
-	/* Maybe we should be checking for extension instructions over here
-	 * instead of all over this crazy switch case. */
 	if (state->flow == invalid_instr) {
+		if (state->instructionLen == 2) {
+			if (arcv2_try_decode_16bit(state->words[0], state)) {
+				return state->instructionLen;
+			}
+		} else if (state->instructionLen == 4) {
+			if (arcv2_try_decode_32bit(state->words[0], state)) {
+				return state->instructionLen;
+			}
+		}
+		
 		if (!((state->_opcode == op_SIMD) && enable_simd)) {
 			instrName = instruction_name(state, state->_opcode,
 				state->words[0],
@@ -2457,7 +2637,6 @@ dsmOneArcInst(bfd_vma addr, struct arcDisState *state, disassemble_info *info) {
 				mwerror(state, "Invalid syntax class\n");
 			}
 		} else {
-			/* Must do the above for this one too */
 			switch (flags) {
 			case AC_SYNTAX_3OP:
 				decodingClass = 0;
