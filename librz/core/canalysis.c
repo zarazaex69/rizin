@@ -81,6 +81,7 @@ static bool find_string_at(RzCore *core, RzBinObject *bobj, ut64 pointer, char *
 		.min_str_length = bin->str_search_cfg.min_length,
 		.prefer_big_endian = big_endian,
 		.check_ascii_freq = bin->str_search_cfg.check_ascii_freq,
+		.user_unprintable = bin->str_search_cfg.user_unprintable,
 	};
 
 	rz_io_pread_at(core->io, pointer, buffer, sizeof(buffer));
@@ -1437,7 +1438,7 @@ RZ_API int rz_core_analysis_fcn(RzCore *core, ut64 at, ut64 from, int reftype, i
 
 	if (core->io->va) {
 		if (!rz_io_is_valid_offset(core->io, at, !aopt->noncode)) {
-			RZ_LOG_DEBUG("address not mapped or not executable at 0x%08" PFMT64x "\n", at);
+			RZ_LOG_VERBOSE("Address not mapped or not executable at 0x%" PFMT64x ".\n", at);
 			return false;
 		}
 	}
@@ -3941,6 +3942,204 @@ static void core_analysis_analyze_local_var_and_arg(RzCore *core) {
 	}
 }
 
+static void analysis_global_vars_from_symbols(RzCore *core) {
+	// DWARF/PDB already enumerate globals with accurate types; only fall back
+	// to symbol-table inference when no debug info is present.
+	RzAnalysisDebugInfo *dbg_info = rz_analysis_get_debug_info(core->analysis);
+	if (dbg_info && dbg_info->dw) {
+		return;
+	}
+	RzBinObject *obj = rz_bin_cur_object(core->bin);
+	if (!obj) {
+		return;
+	}
+	RzTypeDB *typedb = rz_analysis_get_type_db(core->analysis);
+	RzPVector *symbols = (RzPVector *)rz_bin_object_get_symbols(obj);
+	if (!symbols) {
+		return;
+	}
+	bool virt_addr = rz_config_get_b(core->config, "io.va");
+	void **it;
+	rz_pvector_foreach (symbols, it) {
+		RzBinSymbol *sym = *it;
+		if (!sym->name || sym->is_imported) {
+			continue;
+		}
+		if (!sym->type || strcmp(sym->type, RZ_BIN_TYPE_OBJECT_STR)) {
+			continue;
+		}
+		if (!sym->size) {
+			continue;
+		}
+		ut64 addr = virt_addr ? rz_bin_object_get_vaddr(obj, sym->paddr, sym->vaddr) : sym->paddr;
+		if (addr == UT64_MAX || addr == 0) {
+			continue;
+		}
+		if (rz_analysis_var_global_get_byaddr_in(core->analysis, addr)) {
+			continue;
+		}
+		RzType *type = sym->size == 1
+			? rz_type_identifier_of_base_type_str(typedb, "uint8_t")
+			: rz_type_array_of_base_type_str(typedb, "uint8_t", sym->size);
+		if (!type) {
+			continue;
+		}
+		// rz_analysis_var_global_create takes effective ownership of type
+		rz_analysis_var_global_create(core->analysis, sym->name, type, addr);
+	}
+}
+
+static int cmp_ut64s(const void *a, const void *b, RZ_UNUSED void *user) {
+	ut64 va = *(const ut64 *)a;
+	ut64 vb = *(const ut64 *)b;
+	return (va > vb) - (va < vb);
+}
+
+// rz_vector_upper_bound comparator: x is a raw ut64 key, y is a pointer to a ut64 element
+#define CMP_UT64_VAL(x, y) ((int)((x) > *(const ut64 *)(y)) - (int)((x) < *(const ut64 *)(y)))
+
+static bool collect_ht_keys_cb(void *user, const ut64 k, const void *v) {
+	RzVector *vec = user;
+	ut64 key = k;
+	rz_vector_push(vec, &key);
+	return true;
+}
+
+static void analysis_mark_xrefs_as_data(RzCore *core) {
+	int bits = rz_asm_get_bits(core->rasm);
+	ut64 ptr_size = bits == 64 ? 8 : 4;
+
+	RzList *all_xrefs = rz_analysis_xrefs_list(core->analysis);
+	if (!all_xrefs) {
+		return;
+	}
+
+	// collect every target address that has at least one CODE/CALL xref
+	RzSetU *code_call_targets = rz_set_u_new();
+	if (!code_call_targets) {
+		rz_list_free(all_xrefs);
+		return;
+	}
+	RzListIter *iter;
+	RzAnalysisXRef *xref;
+	rz_list_foreach (all_xrefs, iter, xref) {
+		if (xref->type == RZ_ANALYSIS_XREF_TYPE_CODE ||
+			xref->type == RZ_ANALYSIS_XREF_TYPE_CALL) {
+			rz_set_u_add(code_call_targets, xref->to);
+		}
+	}
+
+	// collect unique DATA/STRING targets outside functions
+	RzSetU *data_targets = rz_set_u_new();
+	if (!data_targets) {
+		rz_set_u_free(code_call_targets);
+		rz_list_free(all_xrefs);
+		return;
+	}
+	rz_list_foreach (all_xrefs, iter, xref) {
+		if (xref->type != RZ_ANALYSIS_XREF_TYPE_DATA &&
+			xref->type != RZ_ANALYSIS_XREF_TYPE_STRING) {
+			continue;
+		}
+		ut64 target = xref->to;
+		if (rz_set_u_contains(code_call_targets, target)) {
+			continue;
+		}
+		// only consider xrefs that originate from inside an analyzed function
+		RzAnalysisFunction *fcn_from = rz_analysis_get_fcn_in(core->analysis, xref->from, 0);
+		if (!fcn_from) {
+			continue;
+		}
+		// take bins/arm/elf/K64F-RIOT-SPI.elf for an example
+		// the function dbg.sched_run at 0x00000490 has data xref with 0x000004e0
+		// we take the content of 0x000004e0 as address and check if it is in non-exec section.
+		// [0x000004be]> s 0x000004e0
+		// [0x000004e0]> pd 1
+		// ; DATA XREF from dbg.sched_run @ 0x490
+		// ;-- data.000004e0:
+		// 0x000004e0      .dword 0x1fff0274 ; runqueue_bitcache ; section..bss ; sym..bss ; obj.runqueue_bitcache ; loc._sbss ; loc._szero ; loc._erelocate ; sched.c:135
+		RzBinObject *bo = rz_bin_cur_object(core->bin);
+		if (!bo) {
+			continue;
+		}
+		RzBinSection *sec = rz_bin_get_section_at(bo, target, true);
+		if (sec && (sec->perm & RZ_PERM_X)) {
+			ut8 buf[8] = { 0 };
+			if (!rz_io_read_at_mapped(core->io, target, buf, ptr_size)) {
+				continue;
+			}
+			bool big_endian = rz_config_get_b(core->config, "cfg.bigendian");
+			ut64 stored_val;
+			if (ptr_size == 8) {
+				stored_val = big_endian ? rz_read_be64(buf) : rz_read_le64(buf);
+			} else {
+				stored_val = big_endian ? rz_read_be32(buf) : rz_read_le32(buf);
+			}
+			RzBinSection *val_sec = rz_bin_get_section_at(bo, stored_val, true);
+			if (!val_sec || (val_sec->perm & RZ_PERM_X)) {
+				continue;
+			}
+		}
+		// skip if already annotated by any other analysis
+		if (rz_meta_get_at(core->analysis, target, RZ_META_TYPE_ANY, NULL)) {
+			continue;
+		}
+		if (rz_analysis_get_fcn_in(core->analysis, target, -1)) {
+			continue;
+		}
+		rz_set_u_add(data_targets, target);
+	}
+	rz_list_free(all_xrefs);
+	rz_set_u_free(code_call_targets);
+
+	if (!rz_set_u_size(data_targets)) {
+		rz_set_u_free(data_targets);
+		return;
+	}
+
+	// convert set to sorted vector
+	RzVector *data_addrs = rz_vector_new(sizeof(ut64), NULL, NULL);
+	if (!data_addrs) {
+		rz_set_u_free(data_targets);
+		return;
+	}
+	ht_up_foreach(data_targets, collect_ht_keys_cb, data_addrs);
+	rz_set_u_free(data_targets);
+	rz_vector_sort(data_addrs, cmp_ut64s, false, NULL);
+
+	// sorted vector of function start addresses
+	RzVector *fcn_starts = rz_vector_new(sizeof(ut64), NULL, NULL);
+	if (fcn_starts) {
+		RzList *fcns = rz_analysis_function_list(core->analysis);
+		RzAnalysisFunction *fcn;
+		rz_list_foreach (fcns, iter, fcn) {
+			rz_vector_push(fcn_starts, &fcn->addr);
+		}
+		rz_vector_sort(fcn_starts, cmp_ut64s, false, NULL);
+	}
+
+	// mark each target up to the nearest of: next data target, next function, or ptr_size
+	size_t n = rz_vector_len(data_addrs);
+	for (size_t i = 0; i < n; i++) {
+		ut64 target = *(ut64 *)rz_vector_index_ptr(data_addrs, i);
+		ut64 next_data = (i + 1 < n) ? *(ut64 *)rz_vector_index_ptr(data_addrs, i + 1) : UT64_MAX;
+		ut64 next_fcn = UT64_MAX;
+		if (fcn_starts) {
+			size_t fi;
+			rz_vector_upper_bound(fcn_starts, target, fi, CMP_UT64_VAL);
+			if (fi < rz_vector_len(fcn_starts)) {
+				next_fcn = *(ut64 *)rz_vector_index_ptr(fcn_starts, fi);
+			}
+		}
+		ut64 upper = RZ_MIN(next_data, next_fcn);
+		ut64 size = (upper != UT64_MAX) ? upper - target : ptr_size;
+		rz_meta_set(core->analysis, RZ_META_TYPE_DATA, target, size, NULL);
+	}
+
+	rz_vector_free(data_addrs);
+	rz_vector_free(fcn_starts);
+}
+
 /**
  * Runs all the steps of the deep analysis.
  *
@@ -4113,12 +4312,30 @@ RZ_API bool rz_core_analysis_everything(RzCore *core, bool experimental, char *d
 		rz_core_notify_done(core, "%s", notify);
 	}
 
+	notify = "Recover global variables from symbols";
+	rz_core_notify_begin(core, "%s", notify);
+	analysis_global_vars_from_symbols(core);
+	rz_core_notify_done(core, "%s", notify);
+	rz_core_task_yield(&core->tasks);
+	if (rz_cons_is_breaked()) {
+		return false;
+	}
+
 	if (rz_config_get_b(core->config, "analysis.resolve.pointers")) {
 		notify = "Resolve pointers to data sections";
 		rz_core_notify_begin(core, "%s", notify);
 		rz_core_analysis_resolve_pointers_to_data(core);
 		rz_core_notify_done(core, "%s", notify);
 		rz_core_task_yield(&core->tasks);
+	}
+
+	notify = "Mark data-referenced bytes outside functions";
+	rz_core_notify_begin(core, "%s", notify);
+	analysis_mark_xrefs_as_data(core);
+	rz_core_notify_done(core, "%s", notify);
+	rz_core_task_yield(&core->tasks);
+	if (rz_cons_is_breaked()) {
+		return false;
 	}
 
 	if (experimental) {
@@ -4558,7 +4775,7 @@ RZ_IPI bool rz_core_analysis_types_propagation(RzCore *core) {
 		return false;
 	}
 	RzConfigHold *hold = rz_config_hold_new(core->config);
-	rz_config_hold_i(hold, "io.va", "io.pcache.write", NULL);
+	rz_config_hold_var(hold, "io.va", "io.pcache.write", NULL);
 	bool io_cache = rz_config_get_b(core->config, "io.pcache.write");
 	if (!io_cache) {
 		// XXX. we shouldnt need this, but it breaks 'rizin -c aaa -w ls'
@@ -4853,7 +5070,7 @@ static void sdb_concat_by_path(Sdb *s, const char *path) {
 }
 
 RZ_API void rz_core_analysis_cc_init_by_path(RzCore *core, RZ_NULLABLE const char *path, RZ_NULLABLE const char *homepath) {
-	const char *analysis_arch = rz_config_get(core->config, "analysis.arch");
+	const char *analysis_arch = rz_analysis_get_arch(core->analysis);
 	Sdb *cc = rz_analysis_get_sdb_cc(core->analysis);
 	if (!strcmp(analysis_arch, "null")) {
 		sdb_reset(cc);
